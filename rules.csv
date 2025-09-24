@@ -1,0 +1,7 @@
+name,priority,active,condition_json,add_forms
+US->EU base pack,10,1,"{""origin"":""US"",""destination_in"":[""DE"",""EU""]}","[""CI"",""PL"",""SLI"",""EEI_Worksheet"",""EU_SAD"",""Generic_CoO""]"
+HS 85 electronics,20,1,"{""hs_prefix_in"":[""85""]}","[""CE_DoC"",""RoHS_Declaration"",""REACH_Declaration""]"
+HS 62 apparel,20,1,"{""hs_prefix_in"":[""62""]}","[""Textile_Labeling_Declaration""]"
+Value > 2500 for EEI,30,1,"{""value_gt"":2500}","[""EEI_Worksheet""]"
+Packaging wood,40,1,"{""packaging_eq"":""wood""}","[""ISPM15_Statement""]"
+Controlled flag,50,1,"{""flags_has"":""controlled""}","[""EEI_Worksheet""]"
