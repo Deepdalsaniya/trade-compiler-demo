@@ -1,1 +1,57 @@
+# This file starts the databases/services we need with one command:
+# - Postgres with pgvector (stores rules, documents, embeddings later)
+# - Elasticsearch (keyword search / BM25)
+# - Kibana (web UI to view Elasticsearch data)
+
+version: "3.9"
+
+services:
+  db:
+    # Postgres image that already includes the pgvector extension
+    image: ankane/pgvector:latest
+    container_name: pgvector_db
+    environment:
+      # Basic DB credentials we’ll also reuse from .env
+      - POSTGRES_USER=${PGUSER}
+      - POSTGRES_PASSWORD=${PGPASSWORD}
+      - POSTGRES_DB=${PGDATABASE}
+    ports:
+      # Expose Postgres on your machine at 5432
+      - "5432:5432"
+    volumes:
+      # Run these SQL files automatically at first start
+      - ./db/init.sql:/docker-entrypoint-initdb.d/00_init.sql
+      - ./db/seed_rules.sql:/docker-entrypoint-initdb.d/10_seed.sql
+      # Store DB files in a named volume so data persists across restarts
+      - pgdata:/var/lib/postgresql/data
+
+  es:
+    # Elasticsearch single-node for keyword search
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.14.2
+    container_name: elasticsearch
+    environment:
+      # Single-node mode, no clustering
+      - discovery.type=single-node
+      # Disable security to keep local dev simple
+      - xpack.security.enabled=false
+      # Give ES some memory
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+    ports:
+      # Expose Elasticsearch on 9200
+      - "9200:9200"
+
+  kibana:
+    # Web UI for Elasticsearch
+    image: docker.elastic.co/kibana/kibana:8.14.2
+    container_name: kibana
+    environment:
+      - ELASTICSEARCH_HOSTS=http://es:9200
+    ports:
+      # Open Kibana on http://localhost:5601
+      - "5601:5601"
+    depends_on:
+      - es
+
+volumes:
+  pgdata:
 
