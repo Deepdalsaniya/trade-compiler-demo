@@ -1,0 +1,11 @@
+form_code,field_key,label,type,required
+CI,exporter_name,Exporter Name,text,1
+CI,consignee_name,Consignee Name,text,1
+CI,hs_code,HS Code,text,1
+CI,incoterm,Incoterm,text,1
+CI,invoice_value_usd,Invoice Value (USD),number,1
+CI,origin_country,Country of Origin,text,1
+CI,destination_country,Country of Destination,text,1
+EU_SAD,importer_eori,Importer EORI,text,1
+EU_SAD,procedure_code,Procedure Code,text,1
+EU_SAD,gross_weight_kg,Gross Weight (kg),number,1
