@@ -1,1 +1,22 @@
+# Only official / high-trust pages to start
+sources:
+  - name: CBP_Rulings
+    base: "https://www.cbp.gov"
+    seeds:
+      - "https://www.cbp.gov/trade/rulings"
+    patterns_allow: ["rulings", "trade"]
+    patterns_deny: ["login", "search?"]
+    max_pages: 50
+  - name: BIS_News
+    base: "https://www.bis.doc.gov"
+    seeds:
+      - "https://www.bis.doc.gov/index.php/all-articles"
+    patterns_allow: ["articles", "regulations", "rule"]
+    max_pages: 50
+  - name: EU_TARIC
+    base: "https://taxation-customs.ec.europa.eu"
+    seeds:
+      - "https://taxation-customs.ec.europa.eu/customs-4/taric_en"
+    patterns_allow: ["taric", "customs", "guidance"]
+    max_pages: 50
 
