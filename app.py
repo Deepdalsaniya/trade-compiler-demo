@@ -193,24 +193,54 @@ def parse_nl_heuristic(text: str):
     }
 
 
-def parse_nl_llm(text:str):
+# ---------- LLM-first extraction with normalization & validation
+_VALID_COUNTRIES = ["US","DE","EU","IN","CN","GB","LK","PK","BD","AE","SA","SG","MY","TH","VN"]
+_ALIAS_TO_ISO = {
+    "lanka":"LK","sri lanka":"LK","sl":"LK",
+    "india":"IN","bharat":"IN",
+    "germany":"DE","deutschland":"DE","frg":"DE",
+    "united states":"US","usa":"US","america":"US","u.s.":"US",
+    "uk":"GB","united kingdom":"GB","england":"GB",
+    "china":"CN","prc":"CN","mainland china":"CN"
+}
+# keep your existing _HS_HINTS (now LLM can add suggestions too)
+
+def _norm_country(s: str):
+    if not s: return None
+    s = s.strip().lower()
+    if s in _ALIAS_TO_ISO: return _ALIAS_TO_ISO[s]
+    if s.upper() in _VALID_COUNTRIES: return s.upper()
+    return None  # unknown
+
+def _is_valid_hs(code: str):
+    # Accept 2, 4, 6, or dotted 4+2
+    if re.fullmatch(r"\d{2}", code): return True
+    if re.fullmatch(r"\d{4}", code): return True
+    if re.fullmatch(r"\d{6,8}", code): return True
+    if re.fullmatch(r"\d{4}\.\d{2}", code): return True
+    return False
+
+def parse_nl_llm(text: str):
     if not _OPENAI:
-        return None  # signal to use heuristic
+        return None
     sys = (
-        "Extract trade shipment facts from user text. "
+        "You are a precise information extractor for international trade shipments. "
         "Return ONLY a compact JSON object with keys: "
-        "{origin, destination, hs_list, hs_fallback_prefix, value, packaging, flags, rationale}. "
-        "origin/destination as ISO-like codes (US, DE, EU, IN, CN, GB). "
-        "hs_list as array of strings (e.g., ['8517.62']). "
-        "hs_fallback_prefix as '85' or '62' or null. "
-        "value as number in USD if any. "
-        "packaging as 'wood' or 'standard'. "
-        "flags as array from ['controlled','hazmat','battery']. "
-        "rationale as array of short strings."
+        "{origin, destination, hs_list, hs_fallback_prefix, value, currency, quantity, quantity_unit, packaging, flags, commodity_suggestions, rationale}. "
+        "Rules: "
+        "1) origin/destination as country codes from this allowlist: " + ",".join(_VALID_COUNTRIES) + ". "
+        "   If text says 'to Lanka', set destination='LK'. If you cannot determine, use null. "
+        "2) hs_list: array of strings like '8517.62' or '0409' or '74'. Only include if clearly stated or strongly implied; otherwise empty. "
+        "3) hs_fallback_prefix: a 2–4 digit hint like '85' or '0409' when commodity is clear but HS not given. "
+        "4) value: number ONLY if currency is explicit ($ or USD). Otherwise null. "
+        "5) quantity/quantity_unit: capture phrases like '2 ton', '15 pcs' when present. "
+        "6) packaging: 'wood' if wood/wooden/pallet/crate is mentioned, else 'standard'. "
+        "7) flags: subset of ['controlled','hazmat','battery'] if clearly suggested. "
+        "8) commodity_suggestions: short array of strings like ['brass','honey'] if multiple commodities mentioned. "
+        "9) rationale: short bullet strings explaining choices."
     )
     user = f"Text: {text}"
     try:
-        # Modern OpenAI SDK
         resp = _OPENAI.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role":"system","content":sys},{"role":"user","content":user}],
@@ -218,22 +248,49 @@ def parse_nl_llm(text:str):
         )
         content = resp.choices[0].message.content.strip()
         data = json.loads(content)
-        return data
     except Exception:
         return None
 
-# ---- Optional PDF support (won't break if pdf_utils.py is missing)
-try:
-    from pdf_utils import make_ci_pdf, make_pl_pdf, make_simple_statement
-    PDF_OK = True
-except Exception:
-    PDF_OK = False
+    # Post-process & validate
+    data["origin"] = _norm_country(data.get("origin"))
+    data["destination"] = _norm_country(data.get("destination"))
 
-# ---- 1) CONFIG / CONSTANTS
-RULES_URL = st.secrets.get("RULES_CSV_URL", "rules.csv")
-FIELDS_URL = st.secrets.get("FIELDS_CSV_URL", "fields.csv")
+    # Clean HS list
+    hs_list = []
+    for h in (data.get("hs_list") or []):
+        if isinstance(h, str) and _is_valid_hs(h):
+            hs_list.append(h)
+    data["hs_list"] = hs_list
 
-# ---- 2) HELPERS + SAFE CSV LOADER
+    # Fallback: if no hs_list, allow 2–4 digit prefix suggestion (e.g., '74' brass, '0409' honey)
+    hfp = data.get("hs_fallback_prefix")
+    if hfp and not _is_valid_hs(hfp):
+        hfp = None
+    data["hs_fallback_prefix"] = hfp
+
+    # Normalize packaging
+    pkg = (data.get("packaging") or "").lower()
+    data["packaging"] = "wood" if pkg in ["wood","wooden","pallet","crate"] else "standard"
+
+    # Guard value: must be number
+    try:
+        v = data.get("value", None)
+        data["value"] = float(v) if v is not None else None
+    except:
+        data["value"] = None
+
+    # Quantity
+    try:
+        q = data.get("quantity", None)
+        data["quantity"] = float(q) if q is not None else None
+    except:
+        data["quantity"] = None
+
+    # Flags keep as array
+    data["flags"] = [f for f in (data.get("flags") or []) if f in ["controlled","hazmat","battery"]]
+
+    return data
+
 def _clean_json_text(s: str) -> str:
     if not isinstance(s, str):
         return ""
@@ -324,30 +381,56 @@ with st.expander("Diagnostics", expanded=False):
         st.write("Unique form_code values in Fields:", sorted(fields_df["form_code"].dropna().unique().tolist()))
     st.write("PDF generation available:", PDF_OK)
 # ==== Natural-language input (plain English -> structured) ====
+
 with st.expander("🗣️ Describe your shipment in plain English", expanded=True):
-    nl = st.text_area(
-        "Example: “We’re shipping telecom modems from the US to Germany, value $12k on wooden pallets. Dual-use electronics.”",
-        height=120
-    )
+    nl = st.text_area("Example: “We’re shipping telecom modems from India to Lanka, 2 tons, no price yet.”", height=120)
     if st.button("Understand my description"):
-        result = parse_nl_llm(nl) or parse_nl_heuristic(nl)
-        st.session_state.nl_result = result
+        llm = parse_nl_llm(nl) or {}
+        heur = parse_nl_heuristic(nl) or {}
+
+        # prefer LLM answers, fall back to heuristics
+        merged = {
+            "origin": llm.get("origin") or heur.get("origin"),
+            "destination": llm.get("destination") or heur.get("destination"),
+            "hs_list": llm.get("hs_list") or heur.get("hs_list"),
+            "hs_fallback_prefix": llm.get("hs_fallback_prefix") or heur.get("hs_fallback_prefix"),
+            "value": llm.get("value", None) if llm.get("value", None) is not None else heur.get("value"),
+            "quantity": llm.get("quantity") or heur.get("quantity"),
+            "quantity_unit": llm.get("quantity_unit") or heur.get("quantity_unit"),
+            "packaging": llm.get("packaging") or heur.get("packaging"),
+            "flags": llm.get("flags") or heur.get("flags"),
+            "commodity_suggestions": llm.get("commodity_suggestions") or [],
+            "warnings": (llm.get("warnings") or []) + (heur.get("warnings") or []),
+            "rationale": llm.get("rationale") or []
+        }
+        st.session_state.nl_result = merged
         st.success("Parsed! Scroll down to see values filled in below.")
-        st.json(result)
+        st.json(merged)
+
 
 # Defaults from NL parse (if available)
 nl_result = st.session_state.get("nl_result", {}) if "nl_result" in st.session_state else {}
+
 pref_origin      = nl_result.get("origin") or "US"
 pref_destination = nl_result.get("destination") or "DE"
+
 pref_hs = None
 if nl_result.get("hs_list"):
     pref_hs = nl_result["hs_list"][0]
 elif nl_result.get("hs_fallback_prefix"):
     pref_hs = nl_result["hs_fallback_prefix"]
 pref_hs = pref_hs or "8517.62"
-pref_value = float(nl_result.get("value") or 12000.0)
+
+pref_value = nl_result.get("value")  # can be None
 pref_pack  = nl_result.get("packaging") or "standard"
 pref_flags = nl_result.get("flags") or []
+
+# Optional display of multiple commodities
+for w in nl_result.get("warnings", []):
+    st.warning(w)
+if nl_result.get("commodity_suggestions"):
+    st.info(f"Commodity suggestions: {', '.join(nl_result['commodity_suggestions'])}")
+
 
 # ---- 7) Core rule helpers
 def hs_prefixes(hs_code: str):
@@ -385,7 +468,7 @@ def cond_true(cond: dict, payload: dict) -> bool:
     return True
 
 # ---- 8) Minimal input UI (pre-filled from NL when available)
-countries = ["US","DE","EU","IN","CN","GB"]
+countries = ["US","DE","EU","IN","CN","GB","LK"]
 
 col1, col2, col3 = st.columns(3)
 with col1:
@@ -393,12 +476,11 @@ with col1:
     hs = st.text_input("HS Code or prefix", pref_hs)
 with col2:
     destination = st.selectbox("Destination", countries, index=countries.index(pref_destination) if pref_destination in countries else 1)
-    value = st.number_input("Invoice Value (USD)", min_value=0.0, value=pref_value, step=100.0)
+    value = st.number_input("Invoice Value (USD)", min_value=0.0, value=float(pref_value) if pref_value is not None else 0.0, step=100.0)
 with col3:
     packaging = st.selectbox("Packaging", ["standard","wood"], index=["standard","wood"].index(pref_pack) if pref_pack in ["standard","wood"] else 0)
 
 flags = st.multiselect("Flags", ["controlled","hazmat","battery"], default=pref_flags)
-
 
 # Optional: extra fields for PDFs (won't break if PDFs disabled)
 with st.expander("Parties & shipment (for PDFs / optional)", expanded=False):
