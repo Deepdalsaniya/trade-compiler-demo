@@ -6,6 +6,17 @@ import streamlit as st
 
 st.set_page_config(page_title="Compliance Compiler (MVP)", page_icon="🌍")
 
+# ---- CONFIG / CONSTANTS (must come before loaders & UI that reference them)
+RULES_URL = st.secrets.get("RULES_CSV_URL", "rules.csv")
+FIELDS_URL = st.secrets.get("FIELDS_CSV_URL", "fields.csv")
+
+# ---- Optional PDF support (safe if pdf_utils.py is missing)
+try:
+    from pdf_utils import make_ci_pdf, make_pl_pdf, make_simple_statement
+    PDF_OK = True
+except Exception:
+    PDF_OK = False
+
 # ---------- Natural-language extraction (two layers)
 import re, json
 
