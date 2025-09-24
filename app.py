@@ -1,16 +1,24 @@
 # app.py — Safe, end-to-end Streamlit app (Sheets + fallback + UI + compile + optional PDFs)
+# -----------------------------------------------------------------------
+# This file now includes simple, step-by-step comments for clarity.
+# Each function, section, and logic block is preceded by a simple-language
+# explanation of what it does!
+# -----------------------------------------------------------------------
 
 import json, re
 import pandas as pd
 import streamlit as st
 
+# Set up the Streamlit web app with a title and icon
 st.set_page_config(page_title="Compliance Compiler (MVP)", page_icon="🌍")
 
 # ---- CONFIG / CONSTANTS (must come before loaders & UI that reference them)
+# Get the URLs for the rules and fields CSVs from secrets or default to local files
 RULES_URL = st.secrets.get("RULES_CSV_URL", "rules.csv")
 FIELDS_URL = st.secrets.get("FIELDS_CSV_URL", "fields.csv")
 
 # ---- Optional PDF support (safe if pdf_utils.py is missing)
+# Try to import PDF functions, if not found, set PDF_OK to False
 try:
     from pdf_utils import make_ci_pdf, make_pl_pdf, make_simple_statement
     PDF_OK = True
@@ -20,13 +28,14 @@ except Exception:
 # ---------- Natural-language extraction (two layers)
 import re, json
 
-# Optional LLM client
+# Optional: Try to connect to OpenAI for LLM-based extraction, if available
 try:
     from openai import OpenAI
     _OPENAI = OpenAI(api_key=st.secrets.get("OPENAI_API_KEY")) if st.secrets.get("OPENAI_API_KEY") else None
 except Exception:
     _OPENAI = None
 
+# Dictionaries for mapping country names, hints for HS codes, and flag words
 _COUNTRY_MAP = {
     "united states":"US","usa":"US","us":"US","america":"US",
     "germany":"DE","de":"DE","deutschland":"DE",
@@ -44,10 +53,12 @@ _FLAG_WORDS = {
     "hazmat":"hazmat","dangerous goods":"hazmat","battery":"battery"
 }
 
+# Helper to guess a country code from a token
 def _guess_country(token:str):
     t = token.lower().strip()
     return _COUNTRY_MAP.get(t)
 
+# Try to extract a USD value from a string, only if dollar or usd is mentioned
 def _extract_value_usd(text: str):
     """
     Only return a USD value if currency markers are present: '$' or 'usd'.
@@ -66,6 +77,7 @@ def _extract_value_usd(text: str):
     except:
         return None
 
+# Try to extract quantity and unit (like 2 ton, 15 pcs) from a string
 def _extract_quantity(text: str):
     """
     Extract a shipment quantity + unit if present (e.g., '2 ton', '15 pcs').
@@ -81,9 +93,11 @@ def _extract_quantity(text: str):
     unit = {"t":"ton","tons":"ton","kgs":"kg","pcs":"pcs","pieces":"pcs"}.get(unit, unit)
     return qty, unit
 
+# Set of month names for checking if a number is actually a date
 _MONTHS = {"jan","feb","mar","apr","may","jun","jul","aug","sep","sept","oct","nov","dec",
            "january","february","march","april","june","july","august","september","october","november","december"}
 
+# Extract possible HS codes from a string, avoid matching dates like Dec 10
 def _extract_hs_list(text: str):
     """
     Find HS-like tokens but avoid picking up dates (e.g., 'Dec 10').
@@ -114,13 +128,14 @@ def _extract_hs_list(text: str):
     hs = sorted(set(hs), key=lambda x: (-len(x), x))
     return hs
 
-
+# Guess the packaging type from the text (wood or standard)
 def _extract_packaging(text:str):
     t = text.lower()
     if "wood" in t or "crat" in t: return "wood"
     if "pallet" in t: return "wood"  # good enough for demo
     return "standard"
 
+# Detect certain keywords (flags) in the text
 def _extract_flags(text:str):
     t = text.lower()
     flags = set()
@@ -128,18 +143,19 @@ def _extract_flags(text:str):
         if k in t: flags.add(v)
     return sorted(flags)
 
-# extend hints
+# Add more hints for HS codes for specific commodities
 _HS_HINTS.update({
     "brass":"74",          # Copper & articles (brass alloys fall under Chapter 74)
     "honey":"0409"         # Natural honey
 })
 
+# Main function to parse a shipment description using simple heuristics
 def parse_nl_heuristic(text: str):
     t = text.strip()
     if not t:
         return {}
 
-    # origin / destination
+    # Try to extract from and to countries
     origin = destination = None
 
     # explicit "from X to Y"
@@ -205,6 +221,8 @@ def parse_nl_heuristic(text: str):
 
 
 # ---------- LLM-first extraction with normalization & validation
+
+# List of allowed country codes and aliases for normalizing
 _VALID_COUNTRIES = ["US","DE","EU","IN","CN","GB","LK","PK","BD","AE","SA","SG","MY","TH","VN"]
 _ALIAS_TO_ISO = {
     "lanka":"LK","sri lanka":"LK","sl":"LK",
@@ -216,6 +234,7 @@ _ALIAS_TO_ISO = {
 }
 # keep your existing _HS_HINTS (now LLM can add suggestions too)
 
+# Normalize country names to codes
 def _norm_country(s: str):
     if not s: return None
     s = s.strip().lower()
@@ -223,6 +242,7 @@ def _norm_country(s: str):
     if s.upper() in _VALID_COUNTRIES: return s.upper()
     return None  # unknown
 
+# Check if an HS code is valid (2, 4, 6, or dotted 4+2)
 def _is_valid_hs(code: str):
     # Accept 2, 4, 6, or dotted 4+2
     if re.fullmatch(r"\d{2}", code): return True
@@ -231,6 +251,7 @@ def _is_valid_hs(code: str):
     if re.fullmatch(r"\d{4}\.\d{2}", code): return True
     return False
 
+# Use OpenAI LLM to extract structured shipment data from text
 def parse_nl_llm(text: str):
     if not _OPENAI:
         return None
@@ -262,7 +283,7 @@ def parse_nl_llm(text: str):
     except Exception:
         return None
 
-    # Post-process & validate
+    # Post-process & validate extracted data
     data["origin"] = _norm_country(data.get("origin"))
     data["destination"] = _norm_country(data.get("destination"))
 
@@ -302,12 +323,14 @@ def parse_nl_llm(text: str):
 
     return data
 
+# Clean up text to be valid JSON
 def _clean_json_text(s: str) -> str:
     if not isinstance(s, str):
         return ""
     # replace smart quotes and trim
     return s.replace("“", '"').replace("”", '"').replace("’", "'").strip()
 
+# Try to read a CSV from a remote URL, fall back to a local file, or return empty DataFrame
 def _safe_read_csv(url_or_path: str, local_fallback: str) -> pd.DataFrame:
     """Try remote; if it fails, use local; if that fails, return empty DataFrame."""
     try:
@@ -324,6 +347,7 @@ def _safe_read_csv(url_or_path: str, local_fallback: str) -> pd.DataFrame:
             return pd.DataFrame()
 
 # ---- 3) CACHED LOADERS
+# Load rules from the CSV, caching for 5 minutes, parse columns and handle errors
 @st.cache_data(ttl=300)
 def load_rules() -> pd.DataFrame:
     df = _safe_read_csv(RULES_URL, "rules.csv")
@@ -354,6 +378,7 @@ def load_rules() -> pd.DataFrame:
     # keep only active; still safe if empty
     return df[df["active"] == 1].sort_values(["priority"]).reset_index(drop=True)
 
+# Load fields from the CSV, caching for 5 minutes, parse columns and handle errors
 @st.cache_data(ttl=300)
 def load_fields() -> pd.DataFrame:
     df = _safe_read_csv(FIELDS_URL, "fields.csv")
@@ -367,12 +392,14 @@ def load_fields() -> pd.DataFrame:
     return df
 
 # ---- 4) UI CONTROLS THAT ALWAYS RENDER
+# Button to reload the cached rules and fields
 st.button("🔄 Reload rules/fields", on_click=lambda: st.cache_data.clear())
 with st.expander("Data sources", expanded=False):
     st.write("Rules source:", RULES_URL)
     st.write("Fields source:", FIELDS_URL)
 
 # ---- 5) Load dataframes (after functions exist)
+# Try loading the rules and fields data, show errors but don't crash if missing
 try:
     rules_df = load_rules()
     fields_df = load_fields()
@@ -384,6 +411,7 @@ except Exception as e:
     fields_df = pd.DataFrame(columns=["form_code","field_key","label","type","required"])
 
 # ---- 6) Page title + diagnostics
+# Show page title and some diagnostics
 st.title("🌍 Compliance Compiler (US → EU Demo)")
 with st.expander("Diagnostics", expanded=False):
     st.write("Rules loaded:", len(rules_df) if isinstance(rules_df, pd.DataFrame) else 0)
@@ -393,9 +421,11 @@ with st.expander("Diagnostics", expanded=False):
     st.write("PDF generation available:", PDF_OK)
 # ==== Natural-language input (plain English -> structured) ====
 
+# Section for user to describe their shipment in plain English
 with st.expander("🗣️ Describe your shipment in plain English", expanded=True):
     nl = st.text_area("Example: “We’re shipping telecom modems from India to Lanka, 2 tons, no price yet.”", height=120)
     if st.button("Understand my description"):
+        # Try LLM-based extraction, fallback to heuristics if not available
         llm = parse_nl_llm(nl) or {}
         heur = parse_nl_heuristic(nl) or {}
 
@@ -418,13 +448,14 @@ with st.expander("🗣️ Describe your shipment in plain English", expanded=Tru
         st.success("Parsed! Scroll down to see values filled in below.")
         st.json(merged)
 
-
-# Defaults from NL parse (if available)
+# Get the extracted data from session state (if available)
 nl_result = st.session_state.get("nl_result", {}) if "nl_result" in st.session_state else {}
 
+# Set defaults for the next step, using extracted values if available
 pref_origin      = nl_result.get("origin") or "US"
 pref_destination = nl_result.get("destination") or "DE"
 
+# Prefer HS code from extraction, fallback to prefix or a default
 pref_hs = None
 if nl_result.get("hs_list"):
     pref_hs = nl_result["hs_list"][0]
@@ -436,14 +467,15 @@ pref_value = nl_result.get("value")  # can be None
 pref_pack  = nl_result.get("packaging") or "standard"
 pref_flags = nl_result.get("flags") or []
 
-# Optional display of multiple commodities
+# Show warnings and commodity suggestions if any
 for w in nl_result.get("warnings", []):
     st.warning(w)
 if nl_result.get("commodity_suggestions"):
     st.info(f"Commodity suggestions: {', '.join(nl_result['commodity_suggestions'])}")
 
-
 # ---- 7) Core rule helpers
+
+# Helper to generate HS code prefixes for matching
 def hs_prefixes(hs_code: str):
     hs_code = (hs_code or "").replace(" ", "")
     parts = re.split(r"[.\-]", hs_code)
@@ -463,6 +495,7 @@ def hs_prefixes(hs_code: str):
             res.append(p); seen.add(p)
     return res
 
+# Function to check if a rule's condition matches the payload
 def cond_true(cond: dict, payload: dict) -> bool:
     if "origin" in cond and payload.get("origin") != cond["origin"]: return False
     if "destination_in" in cond and payload.get("destination") not in cond["destination_in"]: return False
@@ -479,8 +512,11 @@ def cond_true(cond: dict, payload: dict) -> bool:
     return True
 
 # ---- 8) Minimal input UI (pre-filled from NL when available)
+
+# List of country codes for the UI
 countries = ["US","DE","EU","IN","CN","GB","LK"]
 
+# Show input fields for origin, destination, HS code, value, packaging, and flags
 col1, col2, col3 = st.columns(3)
 with col1:
     origin = st.selectbox("Origin", countries, index=countries.index(pref_origin) if pref_origin in countries else 0)
@@ -506,6 +542,8 @@ with st.expander("Parties & shipment (for PDFs / optional)", expanded=False):
         currency = st.text_input("Currency", "USD")
 
 # ---- 9) Compile button
+
+# When user clicks "Compile requirements", use rules to decide which forms are required, and show the results
 if st.button("Compile requirements", type="primary"):
     payload = {
         "origin": origin,
@@ -517,11 +555,11 @@ if st.button("Compile requirements", type="primary"):
         "hs_prefixes": hs_prefixes(hs),
     }
 
-    # Start with core
+    # Start with core forms (CI, PL)
     required = {"CI", "PL"}
     rationale = ["Core documents: Commercial Invoice (CI), Packing List (PL)."]
 
-    # Apply rules
+    # Go through all rules to see if any apply, and add any extra required forms
     if not rules_df.empty:
         for _, r in rules_df.iterrows():
             try:
@@ -583,6 +621,7 @@ if st.button("Compile requirements", type="primary"):
             "shipment_ref": invoice_no,
         }
 
+        # If CI required, allow download of Commercial Invoice PDF
         if "CI" in req_list:
             ci_buf = make_ci_pdf(base_data, items_ci)
             st.download_button(
@@ -591,6 +630,7 @@ if st.button("Compile requirements", type="primary"):
                 file_name=f"{invoice_no}_Commercial_Invoice.pdf",
                 mime="application/pdf"
             )
+        # If PL required, allow download of Packing List PDF
         if "PL" in req_list:
             pl_rows = [{"pkg_no": 1, "description": "Example line", "qty": 1, "unit": "pcs", "gross_wt": "", "net_wt": ""}]
             pl_buf = make_pl_pdf(base_data, pl_rows)
@@ -601,6 +641,7 @@ if st.button("Compile requirements", type="primary"):
                 mime="application/pdf"
             )
 
+        # For other required forms, provide placeholder PDFs for download
         placeholder_map = {
             "ISPM15_Statement": "ISPM-15 Wood Packaging Statement",
             "CE_DoC": "EU Declaration of Conformity (Placeholder)",
