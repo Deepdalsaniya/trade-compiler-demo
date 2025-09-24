@@ -68,5 +68,3 @@ def load_fields():
     df["required"] = pd.to_numeric(df["required"], errors="coerce").fillna(1).astype(int)
     return df
 
-st.button("🔄 Reload rules/fields", on_click=lambda: st.cache_data.clear())
-
