@@ -2,8 +2,18 @@ import json, re
 import pandas as pd
 import streamlit as st
 
-RULES_URL = st.secrets.get("RULES_CSV_URL", "rules.csv")
-FIELDS_URL = st.secrets.get("FIELDS_CSV_URL", "fields.csv")
+rules_df = load_rules()
+fields_df = load_fields()
+
+# 👇 Add this right here
+st.button("🔄 Reload rules/fields", on_click=lambda: st.cache_data.clear())
+
+with st.expander("Data sources", expanded=False):
+    st.write("Rules source:", RULES_URL)
+    st.write("Fields source:", FIELDS_URL)
+
+st.title("🌍 Compliance Compiler (US → EU Demo)")
+
 
 def _clean_json_text(s: str) -> str:
     if not isinstance(s, str): return ""
