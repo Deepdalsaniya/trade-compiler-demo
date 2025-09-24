@@ -1,1 +1,12 @@
+# Web API
+fastapi
+uvicorn[standard]
+pydantic
+
+# Postgres
+psycopg2-binary
+pgvector
+
+# Search client (to talk to Elasticsearch)
+elasticsearch
 
