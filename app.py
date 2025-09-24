@@ -6,6 +6,146 @@ import streamlit as st
 
 st.set_page_config(page_title="Compliance Compiler (MVP)", page_icon="🌍")
 
+# ---------- Natural-language extraction (two layers)
+import re, json
+
+# Optional LLM client
+try:
+    from openai import OpenAI
+    _OPENAI = OpenAI(api_key=st.secrets.get("OPENAI_API_KEY")) if st.secrets.get("OPENAI_API_KEY") else None
+except Exception:
+    _OPENAI = None
+
+_COUNTRY_MAP = {
+    "united states":"US","usa":"US","us":"US","america":"US",
+    "germany":"DE","de":"DE","deutschland":"DE",
+    "european union":"EU","eu":"EU",
+    "china":"CN","cn":"CN","india":"IN","in":"IN","united kingdom":"GB","uk":"GB"
+}
+_HS_HINTS = {
+    # broad fallbacks when no HS in text
+    "electronics":"85","laptop":"85","phone":"85","modem":"85","router":"85","cable":"85",
+    "apparel":"62","clothing":"62","garment":"62","shirt":"62","trousers":"62","jeans":"62",
+    "textile":"62","fabric":"62"
+}
+_FLAG_WORDS = {
+    "controlled":"controlled","dual use":"controlled","dual-use":"controlled",
+    "hazmat":"hazmat","dangerous goods":"hazmat","battery":"battery"
+}
+
+def _guess_country(token:str):
+    t = token.lower().strip()
+    return _COUNTRY_MAP.get(t)
+
+def _extract_value_usd(text:str):
+    # $12,000 or 12000 USD or value 12k etc.
+    m = re.search(r'(\$|usd\s*)?([0-9]{1,3}(?:[, ]?[0-9]{3})*(?:\.[0-9]+)?)(?:\s*usd|\s*dollars|\s*\$)?', text.lower())
+    if not m: return None
+    num = m.group(2).replace(",","").replace(" ","")
+    try: return float(num)
+    except: return None
+
+def _extract_hs_list(text:str):
+    # catch 6-digit, 4+2 dotted, or 2-digit chapter
+    patterns = [
+        r'\b(\d{4}\.\d{2})\b',  # 8517.62
+        r'\b(\d{6,8})\b',       # 851762
+        r'\b(\d{2})\b'          # 85 (be careful; we’ll dedupe)
+    ]
+    hs = []
+    for p in patterns:
+        for m in re.finditer(p, text):
+            hs.append(m.group(1))
+    # prefer longer codes
+    hs = sorted(set(hs), key=lambda x: (len(x), x))
+    return hs
+
+def _extract_packaging(text:str):
+    t = text.lower()
+    if "wood" in t or "crat" in t: return "wood"
+    if "pallet" in t: return "wood"  # good enough for demo
+    return "standard"
+
+def _extract_flags(text:str):
+    t = text.lower()
+    flags = set()
+    for k,v in _FLAG_WORDS.items():
+        if k in t: flags.add(v)
+    return sorted(flags)
+
+def parse_nl_heuristic(text:str):
+    t = text.strip()
+    if not t: 
+        return {}
+
+    # origin/destination: pick first two country mentions; allow “from X to Y”
+    origin = destination = None
+    # explicit “from … to …”
+    m = re.search(r'from\s+([a-zA-Z ]+?)\s+to\s+([a-zA-Z ]+)', t, flags=re.I)
+    if m:
+        origin = _guess_country(m.group(1)) or origin
+        destination = _guess_country(m.group(2)) or destination
+    # otherwise scan all tokens for any country names
+    if not origin or not destination:
+        found = []
+        for name,code in _COUNTRY_MAP.items():
+            if re.search(r'\b'+re.escape(name)+r'\b', t, flags=re.I):
+                found.append(code)
+        if not origin and found: origin = found[0]
+        if not destination and len(found) >= 2: destination = found[1]
+
+    hs_list = _extract_hs_list(t)
+    value = _extract_value_usd(t)
+    packaging = _extract_packaging(t)
+    flags = _extract_flags(t)
+
+    # If no HS, try to infer HS prefix from product words
+    hs_prefix = None
+    if not hs_list:
+        for kw, pref in _HS_HINTS.items():
+            if kw in t.lower():
+                hs_prefix = pref
+                break
+
+    return {
+        "origin": origin,
+        "destination": destination,
+        "hs_list": hs_list,     # may be []
+        "hs_fallback_prefix": hs_prefix,
+        "value": value,
+        "packaging": packaging,
+        "flags": flags
+    }
+
+def parse_nl_llm(text:str):
+    if not _OPENAI:
+        return None  # signal to use heuristic
+    sys = (
+        "Extract trade shipment facts from user text. "
+        "Return ONLY a compact JSON object with keys: "
+        "{origin, destination, hs_list, hs_fallback_prefix, value, packaging, flags, rationale}. "
+        "origin/destination as ISO-like codes (US, DE, EU, IN, CN, GB). "
+        "hs_list as array of strings (e.g., ['8517.62']). "
+        "hs_fallback_prefix as '85' or '62' or null. "
+        "value as number in USD if any. "
+        "packaging as 'wood' or 'standard'. "
+        "flags as array from ['controlled','hazmat','battery']. "
+        "rationale as array of short strings."
+    )
+    user = f"Text: {text}"
+    try:
+        # Modern OpenAI SDK
+        resp = _OPENAI.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"system","content":sys},{"role":"user","content":user}],
+            temperature=0.1
+        )
+        content = resp.choices[0].message.content.strip()
+        data = json.loads(content)
+        return data
+    except Exception:
+        return None
+
 # ---- Optional PDF support (won't break if pdf_utils.py is missing)
 try:
     from pdf_utils import make_ci_pdf, make_pl_pdf, make_simple_statement
@@ -107,6 +247,31 @@ with st.expander("Diagnostics", expanded=False):
     if not fields_df.empty:
         st.write("Unique form_code values in Fields:", sorted(fields_df["form_code"].dropna().unique().tolist()))
     st.write("PDF generation available:", PDF_OK)
+# ==== Natural-language input (plain English -> structured) ====
+with st.expander("🗣️ Describe your shipment in plain English", expanded=True):
+    nl = st.text_area(
+        "Example: “We’re shipping telecom modems from the US to Germany, value $12k on wooden pallets. Dual-use electronics.”",
+        height=120
+    )
+    if st.button("Understand my description"):
+        result = parse_nl_llm(nl) or parse_nl_heuristic(nl)
+        st.session_state.nl_result = result
+        st.success("Parsed! Scroll down to see values filled in below.")
+        st.json(result)
+
+# Defaults from NL parse (if available)
+nl_result = st.session_state.get("nl_result", {}) if "nl_result" in st.session_state else {}
+pref_origin      = nl_result.get("origin") or "US"
+pref_destination = nl_result.get("destination") or "DE"
+pref_hs = None
+if nl_result.get("hs_list"):
+    pref_hs = nl_result["hs_list"][0]
+elif nl_result.get("hs_fallback_prefix"):
+    pref_hs = nl_result["hs_fallback_prefix"]
+pref_hs = pref_hs or "8517.62"
+pref_value = float(nl_result.get("value") or 12000.0)
+pref_pack  = nl_result.get("packaging") or "standard"
+pref_flags = nl_result.get("flags") or []
 
 # ---- 7) Core rule helpers
 def hs_prefixes(hs_code: str):
@@ -143,17 +308,21 @@ def cond_true(cond: dict, payload: dict) -> bool:
     if "flags_has" in cond and cond["flags_has"] not in payload.get("flags", []): return False
     return True
 
-# ---- 8) Minimal input UI
+# ---- 8) Minimal input UI (pre-filled from NL when available)
+countries = ["US","DE","EU","IN","CN","GB"]
+
 col1, col2, col3 = st.columns(3)
 with col1:
-    origin = st.selectbox("Origin", ["US"])
-    hs = st.text_input("HS Code", "8517.62")
+    origin = st.selectbox("Origin", countries, index=countries.index(pref_origin) if pref_origin in countries else 0)
+    hs = st.text_input("HS Code or prefix", pref_hs)
 with col2:
-    destination = st.selectbox("Destination", ["DE", "EU"])
-    value = st.number_input("Invoice Value (USD)", min_value=0.0, value=12000.0, step=100.0)
+    destination = st.selectbox("Destination", countries, index=countries.index(pref_destination) if pref_destination in countries else 1)
+    value = st.number_input("Invoice Value (USD)", min_value=0.0, value=pref_value, step=100.0)
 with col3:
-    packaging = st.selectbox("Packaging", ["standard", "wood"])
-flags = st.multiselect("Flags", ["controlled"])
+    packaging = st.selectbox("Packaging", ["standard","wood"], index=["standard","wood"].index(pref_pack) if pref_pack in ["standard","wood"] else 0)
+
+flags = st.multiselect("Flags", ["controlled","hazmat","battery"], default=pref_flags)
+
 
 # Optional: extra fields for PDFs (won't break if PDFs disabled)
 with st.expander("Parties & shipment (for PDFs / optional)", expanded=False):
