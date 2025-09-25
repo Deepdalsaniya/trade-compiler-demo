@@ -5,3 +5,4 @@ HS 62 apparel,20,1,"{""hs_prefix_in"":[""62""]}","[""Textile_Labeling_Declaratio
 Value > 2500 for EEI,30,1,"{""value_gt"":2500}","[""EEI_Worksheet""]"
 Packaging wood,40,1,"{""packaging_eq"":""wood""}","[""ISPM15_Statement""]"
 Controlled flag,50,1,"{""flags_has"":""controlled""}","[""EEI_Worksheet""]"
+US import – foods/animal origin (Chapter 04),10,1,"{""destination_in"": [""US""], ""hs_prefix_in"": [""04""]}","["US_FDA_PriorNotice"]"
