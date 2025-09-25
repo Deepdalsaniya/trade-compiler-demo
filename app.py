@@ -318,16 +318,37 @@ def hs_prefixes(hs_code: str):
     return res
 
 def cond_true(cond: dict, payload: dict) -> bool:
-    if "origin" in cond and payload.get("origin") != cond["origin"]: return False
-    if "destination_in" in cond and payload.get("destination") not in cond["destination_in"]: return False
+    # origin must match exactly
+    if "origin" in cond and payload.get("origin") != cond["origin"]:
+        return False
+
+    # destination must be one of the allowed values
+    if "destination_in" in cond and payload.get("destination") not in cond["destination_in"]:
+        return False
+
+    # HS prefix logic — true if ANY target matches ANY of the prefixes
     if "hs_prefix_in" in cond:
-        prefs = payload.get("hs_prefixes", []); targets = cond["hs_prefix_in"]
-        if not any(any(p.startswith(t) or p == t for p in prefs) for t in targets): return False
+        prefs = payload.get("hs_prefixes", [])
+        targets = cond["hs_prefix_in"]
+        if not any(any(p.startswith(t) or p == t for p in prefs) for t in targets):
+            return False
+
+    # value threshold (split into two lines to avoid the syntax error)
     if "value_gt" in cond:
-        v = payload.get("value"); if v is None or float(v) <= float(cond["value_gt"]): return False
-    if "packaging_eq" in cond and packaging != cond["packaging_eq"]: return False
-    if "flags_has" in cond and cond["flags_has"] not in flags: return False
+        v = payload.get("value")
+        if v is None or float(v) <= float(cond["value_gt"]):
+            return False
+
+    # packaging equality (read from payload, not outer variable)
+    if "packaging_eq" in cond and payload.get("packaging") != cond["packaging_eq"]:
+        return False
+
+    # flags containment (read from payload, not outer variable)
+    if "flags_has" in cond and cond["flags_has"] not in payload.get("flags", []):
+        return False
+
     return True
+
 
 # ---- Compile
 if st.button("Compile requirements", type="primary"):
