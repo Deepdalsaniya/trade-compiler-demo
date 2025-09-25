@@ -35,6 +35,7 @@ _COUNTRY_MAP = {
     "lanka":"LK","sri lanka":"LK","sl":"LK",
     "mexico":"MX","mx":"MX",
     "brazil":"BR","br":"BR"
+    "canada": "CA", "ca": "CA"
 }
 
 # Chapter/heading hints by commodity keywords
@@ -49,6 +50,11 @@ _HS_HINTS = {
     "fertilizer":"31","fertilisers":"31",
     "tractor":"8701","tractors":"8701"
 }
+
+_HS_HINTS.update({
+    "egg": "0407",
+    "eggs": "0407"
+})
 
 _FLAG_WORDS = {
     "controlled":"controlled","dual use":"controlled","dual-use":"controlled",
@@ -298,6 +304,17 @@ with st.expander("🗣️ Describe your shipment in plain English", expanded=Tru
         "Example: “We’re importing **fertilizer** from **Brazil** to the **United States**, no price yet.”",
         height=120
     )
+    if (not origin or not destination or not hs):
+    if nl and nl.strip():
+        llm = parse_nl_llm(nl) or {}
+        heur = parse_nl_heuristic(nl) or {}
+        origin = origin or _norm_country(llm.get("origin") or heur.get("origin"))
+        destination = destination or _norm_country(llm.get("destination") or heur.get("destination"))
+        if not hs:
+            pick = (llm.get("hs_list") or heur.get("hs_list") or [])
+            pick = pick[0] if pick else (llm.get("hs_fallback_prefix") or heur.get("hs_fallback_prefix"))
+            hs = normalize_hs(pick) if pick else hs
+            
     if st.button("Understand my description"):
         llm = parse_nl_llm(nl) or {}
         heur = parse_nl_heuristic(nl) or {}
@@ -320,6 +337,15 @@ with st.expander("🗣️ Describe your shipment in plain English", expanded=Tru
         st.json(merged)
 
 nl_result = st.session_state.get("nl_result", {}) if "nl_result" in st.session_state else {}
+
+if nl_result:
+    chips = []
+    if nl_result.get("origin"): chips.append(f"Origin: {nl_result['origin']}")
+    if nl_result.get("destination"): chips.append(f"Destination: {nl_result['destination']}")
+    if nl_result.get("hs_list"): chips.append(f"HS: {normalize_hs(nl_result['hs_list'][0])}")
+    elif nl_result.get("hs_fallback_prefix"): chips.append(f"HS hint: {normalize_hs(nl_result['hs_fallback_prefix'])}")
+    if chips:
+        st.success(" • ".join(chips))
 
 # -------------------- Shipment details --------------------
 st.markdown("### Shipment details")
@@ -429,6 +455,18 @@ if st.button("Compile requirements", type="primary"):
                         reasons_by_form.setdefault(f, []).append(f'Rule: {r.get("name","(unnamed)")}')
             except Exception:
                 st.warning(f"Skipped a bad rule row: {getattr(r,'name','(no name)')}")
+    
+    # Hard stop if still missing essentials (prevents irrelevant outputs)
+    missing = []
+    if not origin: missing.append("origin")
+    if not destination: missing.append("destination")
+    if not hs: missing.append("HS code (chapter or 4-digit heading)")
+    
+    if missing:
+        st.error("I couldn’t extract: " + ", ".join(missing) + ". "
+                 "Please click **Understand my description** or fill the fields manually.")
+        st.stop()
+
     else:
         st.info("No active rules loaded — showing only core forms (CI, PL).")
 
