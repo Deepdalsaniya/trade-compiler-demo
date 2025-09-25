@@ -284,11 +284,38 @@ pref_value = nl_result.get("value") if nl_result.get("value") is not None else 1
 # ——— Minimal input UI (packaging/flags now fixed and hidden)
 col1, col2, col3 = st.columns(3)
 with col1:
-    origin = st.selectbox("Origin", countries, index=countries.index(pref_origin) if pref_origin in countries else 0)
+    origin_input = st.text_input("Origin (country name or code)", nl_result.get("origin") or "US")
     hs = st.text_input("HS Code or prefix", pref_hs)
+
 with col2:
-    destination = st.selectbox("Destination", countries, index=countries.index(pref_destination) if pref_destination in countries else 1)
-    value = st.number_input("Invoice Value (USD)", min_value=0.0, value=float(pref_value), step=100.0)
+    destination_input = st.text_input("Destination (country name or code)", nl_result.get("destination") or "DE")
+    value = st.number_input("Invoice Value (USD)", min_value=0.0,
+                            value=float(nl_result.get("value")) if nl_result.get("value") is not None else 12000.0,
+                            step=100.0)
+
+# Normalize whatever the user typed to your ISO-like codes
+def _normalize_country_free(s: str):
+    if not s: return None
+    s = s.strip()
+    # try direct 2-letter code first
+    if len(s) in (2,3) and s.upper() in (_VALID_COUNTRIES + ["EU"]):
+        return s.upper()
+    # try alias map
+    c = _ALIAS_TO_ISO.get(s.lower())
+    if c: return c
+    # try the simple guesser
+    c = _guess_country(s)
+    return c
+
+origin = _normalize_country_free(origin_input) or "US"
+destination = _normalize_country_free(destination_input) or "DE"
+
+# Optional: warn if we had to fall back
+if not _normalize_country_free(origin_input):
+    st.warning("Could not recognize the origin you typed — defaulting to US.")
+if not _normalize_country_free(destination_input):
+    st.warning("Could not recognize the destination you typed — defaulting to DE.")
+
 with col3:
     st.write("")  # spacer
     st.write("")
