@@ -1,4 +1,4 @@
-# app.py — Streamlit app with simplified UI and clearer wording
+# app.py — Compliance Compiler (AI-first, HS normalized, no irrelevant forms)
 
 import json, re
 import pandas as pd
@@ -6,46 +6,73 @@ import streamlit as st
 
 st.set_page_config(page_title="Compliance Compiler", page_icon="🌍")
 
-# ---- CONFIG
+# -------------------- CONFIG --------------------
 RULES_URL = st.secrets.get("RULES_CSV_URL", "rules.csv")
-FIELDS_URL = st.secrets.get("FIELDS_CSV_URL", "fields.csv")
+FIELDS_URL = st.secrets.get("FIELDS_CSV_URL", "fields.csv")  # kept for future (not rendered)
 
-# ---- Optional PDF support
+# Optional PDF support
 try:
-    from pdf_utils import make_ci_pdf, make_pl_pdf  # removed make_simple_statement use
+    from pdf_utils import make_ci_pdf, make_pl_pdf
     PDF_OK = True
 except Exception:
     PDF_OK = False
 
-# ---------- Natural-language extraction (your existing logic)
+# -------------------- LLM (optional) --------------------
 try:
     from openai import OpenAI
     _OPENAI = OpenAI(api_key=st.secrets.get("OPENAI_API_KEY")) if st.secrets.get("OPENAI_API_KEY") else None
 except Exception:
     _OPENAI = None
 
+# -------------------- Dictionaries / Hints --------------------
 _COUNTRY_MAP = {
-    "united states":"US","usa":"US","us":"US","america":"US",
+    "united states":"US","usa":"US","us":"US","america":"US","u.s.":"US",
     "germany":"DE","de":"DE","deutschland":"DE",
     "european union":"EU","eu":"EU",
-    "china":"CN","cn":"CN","india":"IN","in":"IN",
+    "china":"CN","cn":"CN",
+    "india":"IN","in":"IN","bharat":"IN",
     "united kingdom":"GB","uk":"GB","england":"GB",
-    "lanka":"LK","sri lanka":"LK","sl":"LK"
+    "lanka":"LK","sri lanka":"LK","sl":"LK",
+    "mexico":"MX","mx":"MX",
+    "brazil":"BR","br":"BR"
 }
-_HS_HINTS = {
-    "electronics":"85","laptop":"85","phone":"85","modem":"85","router":"85","cable":"85",
-    "apparel":"62","clothing":"62","garment":"62","shirt":"62","trousers":"62","jeans":"62",
-    "textile":"62","fabric":"62",
-    "brass":"74","honey":"0409"
-}
-_FLAG_WORDS = {"controlled":"controlled","dual use":"controlled","dual-use":"controlled",
-               "hazmat":"hazmat","dangerous goods":"hazmat","battery":"battery"}
 
-def _guess_country(token:str):
-    return _COUNTRY_MAP.get(token.lower().strip())
+# Chapter/heading hints by commodity keywords
+_HS_HINTS = {
+    # electronics
+    "electronics":"85","laptop":"85","phone":"85","modem":"85","router":"85","cable":"85",
+    # apparel/textile
+    "apparel":"62","clothing":"62","garment":"62","shirt":"62","trousers":"62","jeans":"62","textile":"62","fabric":"62",
+    # metals / food
+    "brass":"74","honey":"0409",
+    # new: fertilizer, tractors
+    "fertilizer":"31","fertilisers":"31",
+    "tractor":"8701","tractors":"8701"
+}
+
+_FLAG_WORDS = {
+    "controlled":"controlled","dual use":"controlled","dual-use":"controlled",
+    "hazmat":"hazmat","dangerous goods":"hazmat","battery":"battery"
+}
+
+_VALID_COUNTRIES = ["US","DE","EU","IN","CN","GB","LK","PK","BD","AE","SA","SG","MY","TH","VN","MX","BR"]
+_ALIAS_TO_ISO = {**{k:v for k,v in _COUNTRY_MAP.items()}}
+
+_MONTHS = {"jan","feb","mar","apr","may","jun","jul","aug","sep","sept","oct","nov","dec",
+           "january","february","march","april","june","july","august","september","october","november","december"}
+
+# -------------------- Helpers --------------------
+def _guess_country(token: str):
+    return _COUNTRY_MAP.get((token or "").lower().strip())
+
+def _norm_country(s: str):
+    if not s: return None
+    s = s.strip()
+    if s.upper() in _VALID_COUNTRIES or s.upper()=="EU": return s.upper()
+    return _ALIAS_TO_ISO.get(s.lower()) or _guess_country(s) or None
 
 def _extract_value_usd(text: str):
-    t = text.lower()
+    t = (text or "").lower()
     if "$" not in t and " usd" not in t and "usd " not in t: return None
     m = re.search(r'(\$|usd\s*)?([0-9]{1,3}(?:[, ]?[0-9]{3})*(?:\.[0-9]+)?)', t)
     if not m: return None
@@ -53,18 +80,15 @@ def _extract_value_usd(text: str):
     except: return None
 
 def _extract_quantity(text: str):
-    t = text.lower()
+    t = (text or "").lower()
     m = re.search(r'(\d+(?:\.\d+)?)\s*(tons?|t|kg|kgs|kilograms?|pcs?|pieces?)', t)
     if not m: return None, None
     qty = float(m.group(1)); unit = m.group(2)
     unit = {"t":"ton","tons":"ton","kgs":"kg","pcs":"pcs","pieces":"pcs"}.get(unit, unit)
     return qty, unit
 
-_MONTHS = {"jan","feb","mar","apr","may","jun","jul","aug","sep","sept","oct","nov","dec",
-           "january","february","march","april","june","july","august","september","october","november","december"}
-
 def _extract_hs_list(text: str):
-    t = text
+    t = text or ""
     hs = []
     for m in re.finditer(r'\b(\d{6,8})\b', t): hs.append(m.group(1))
     for m in re.finditer(r'\b(\d{4}\.\d{2})\b', t): hs.append(m.group(1))
@@ -75,19 +99,42 @@ def _extract_hs_list(text: str):
     return sorted(set(hs), key=lambda x: (-len(x), x))
 
 def _extract_packaging(text:str):
-    t = text.lower()
+    t = (text or "").lower()
     if "wood" in t or "crat" in t or "pallet" in t: return "wood"
     return "standard"
 
 def _extract_flags(text:str):
-    t = text.lower(); flags = set()
+    t = (text or "").lower(); flags = set()
     for k,v in _FLAG_WORDS.items():
         if k in t: flags.add(v)
     return sorted(flags)
 
+def normalize_hs(hs_code: str) -> str:
+    """Return normalized HS: 4-digit heading when possible, else 2-digit chapter."""
+    if not hs_code: return ""
+    clean = re.sub(r"[^\d]", "", hs_code)
+    if not clean: return ""
+    if len(clean) >= 4: return clean[:4]
+    if len(clean) >= 2: return clean[:2]
+    return clean
+
+def hs_prefixes(hs_code: str):
+    """Return prefixes for rules: [chapter(2), heading(4) if available]."""
+    code = normalize_hs(hs_code)
+    if not code: return []
+    out = []
+    if len(code) >= 2: out.append(code[:2])
+    if len(code) >= 4: out.append(code[:4])
+    return out
+
+def _is_valid_hs(code: str):
+    return bool(re.fullmatch(r"\d{2}|\d{4}|\d{6,8}|\d{4}\.\d{2}", code or ""))
+
+# -------------------- Parsers --------------------
 def parse_nl_heuristic(text: str):
-    t = text.strip()
+    t = (text or "").strip()
     if not t: return {}
+
     origin = destination = None
     m = re.search(r'\bfrom\s+([a-zA-Z ]+?)\s+to\s+([a-zA-Z ]+)\b', t, flags=re.I)
     if m:
@@ -104,67 +151,78 @@ def parse_nl_heuristic(text: str):
             origin = (found[0] if destination != found[0] else (found[1] if len(found)>1 else None))
         if not destination and len(found) >= 1:
             destination = found[-1]
+
     qty, qty_unit = _extract_quantity(t)
     value = _extract_value_usd(t)
     hs_list = _extract_hs_list(t)
+
     hs_prefix = None
     if not hs_list:
         for kw, pref in _HS_HINTS.items():
             if re.search(r'\b'+re.escape(kw)+r'\b', t.lower()):
                 hs_prefix = pref; break
+
     packaging = _extract_packaging(t)
     flags = _extract_flags(t)
+
     detected = [kw for kw in _HS_HINTS.keys() if kw in t.lower()]
     warnings = []
     if len(detected) > 1:
         warnings.append(f"Multiple commodity hints found: {detected}. Using '{detected[0]}' → HS {_HS_HINTS[detected[0]]}.")
-    return {"origin":origin,"destination":destination,"hs_list":hs_list,
-            "hs_fallback_prefix":hs_prefix,"value":value,"quantity":qty,"quantity_unit":qty_unit,
-            "packaging":packaging,"flags":flags,"warnings":warnings}
 
-_VALID_COUNTRIES = ["US","DE","EU","IN","CN","GB","LK","PK","BD","AE","SA","SG","MY","TH","VN"]
-_ALIAS_TO_ISO = {"lanka":"LK","sri lanka":"LK","sl":"LK","india":"IN","bharat":"IN","germany":"DE","deutschland":"DE",
-                 "united states":"US","usa":"US","america":"US","u.s.":"US","uk":"GB","england":"GB","china":"CN","prc":"CN"}
-
-def _norm_country(s: str):
-    if not s: return None
-    s = s.strip().lower()
-    if s in _ALIAS_TO_ISO: return _ALIAS_TO_ISO[s]
-    if s.upper() in _VALID_COUNTRIES: return s.upper()
-    return None
-
-def _is_valid_hs(code: str):
-    return bool(re.fullmatch(r"\d{2}|\d{4}|\d{6,8}|\d{4}\.\d{2}", code))
+    return {
+        "origin": origin, "destination": destination,
+        "hs_list": hs_list, "hs_fallback_prefix": hs_prefix,
+        "value": value, "quantity": qty, "quantity_unit": qty_unit,
+        "packaging": packaging, "flags": flags, "warnings": warnings
+    }
 
 def parse_nl_llm(text: str):
     if not _OPENAI: return None
-    sys = ("You are a precise information extractor for international trade shipments. "
-           "Return ONLY a compact JSON object with keys: "
-           "{origin, destination, hs_list, hs_fallback_prefix, value, currency, quantity, quantity_unit, packaging, flags, commodity_suggestions, rationale}. "
-           "Use allowlist: " + ",".join(_VALID_COUNTRIES) + ".")
+    sys = (
+        "You are a precise information extractor for international trade shipments. "
+        "Return ONLY a compact JSON object with keys: "
+        "{origin, destination, hs_list, hs_fallback_prefix, value, quantity, quantity_unit, packaging, flags, commodity_suggestions, rationale}. "
+        "origin/destination must be ISO-like codes from: " + ",".join(_VALID_COUNTRIES) + ". "
+        "hs_list may include 2/4/6-digit or dotted 4+2. "
+        "hs_fallback_prefix can be a 2 or 4 digit hint when only commodity is clear. "
+        "value must be a number only if $ or USD is explicit. "
+        "packaging = 'wood' if wood/pallet/crate appears, else 'standard'. "
+        "flags ⊆ ['controlled','hazmat','battery']."
+    )
     try:
         resp = _OPENAI.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role":"system","content":sys},{"role":"user","content":f'Text: {text}'}],
+            messages=[{"role":"system","content":sys},{"role":"user","content":f"Text: {text}"}],
             temperature=0.1
         )
         data = json.loads(resp.choices[0].message.content.strip())
     except Exception:
         return None
+
     data["origin"] = _norm_country(data.get("origin"))
     data["destination"] = _norm_country(data.get("destination"))
-    data["hs_list"] = [h for h in (data.get("hs_list") or []) if isinstance(h,str) and _is_valid_hs(h)]
+    data["hs_list"] = [h for h in (data.get("hs_list") or []) if _is_valid_hs(h)]
     hfp = data.get("hs_fallback_prefix")
-    data["hs_fallback_prefix"] = hfp if (isinstance(hfp,str) and _is_valid_hs(hfp)) else hfp if isinstance(hfp,str) and len(hfp) in (2,4) else None
-    data["packaging"] = "wood" if (data.get("packaging","").lower() in ["wood","wooden","pallet","crate"]) else "standard"
+    if isinstance(hfp, str):
+        hfp_clean = re.sub(r"[^\d]", "", hfp)
+        data["hs_fallback_prefix"] = hfp_clean[:4] if len(hfp_clean) >= 4 else hfp_clean[:2] if len(hfp_clean)>=2 else None
+    else:
+        data["hs_fallback_prefix"] = None
+
+    pkg = (data.get("packaging") or "").lower()
+    data["packaging"] = "wood" if pkg in ["wood","wooden","pallet","crate"] else "standard"
+
+    # value / qty numeric guards
     try: data["value"] = float(data["value"]) if data.get("value") is not None else None
     except: data["value"] = None
     try: data["quantity"] = float(data["quantity"]) if data.get("quantity") is not None else None
     except: data["quantity"] = None
+
     data["flags"] = [f for f in (data.get("flags") or []) if f in ["controlled","hazmat","battery"]]
     return data
 
-# ---- Safe CSV loader
+# -------------------- CSV loaders --------------------
 def _clean_json_text(s: str) -> str:
     if not isinstance(s, str): return ""
     return s.replace("“", '"').replace("”", '"').replace("’", "'").strip()
@@ -202,7 +260,7 @@ def load_rules() -> pd.DataFrame:
 
 @st.cache_data(ttl=300)
 def load_fields() -> pd.DataFrame:
-    # kept for future, but we won’t render it now
+    # kept for future (UI now hides this)
     df = _safe_read_csv(FIELDS_URL, "fields.csv")
     if df.empty: df = pd.DataFrame(columns=["form_code","field_key","label","type","required"])
     df.columns = [c.strip() for c in df.columns]
@@ -211,13 +269,12 @@ def load_fields() -> pd.DataFrame:
     df["required"] = pd.to_numeric(df["required"], errors="coerce").fillna(1).astype(int)
     return df
 
-# ---- Always-visible controls
+# -------------------- Header / Intro --------------------
 st.button("🔄 Reload rules/fields", on_click=lambda: st.cache_data.clear())
 with st.expander("Data sources", expanded=False):
     st.write("Rules source:", RULES_URL)
     st.write("Fields source:", FIELDS_URL)
 
-# ---- Load data
 try:
     rules_df = load_rules()
     fields_df = load_fields()
@@ -228,7 +285,6 @@ except Exception as e:
     rules_df = pd.DataFrame(columns=["name","priority","active","condition_json","add_forms"])
     fields_df = pd.DataFrame(columns=["form_code","field_key","label","type","required"])
 
-# ---- Header + friendly intro
 st.markdown("## Compliance Compiler")
 st.write(
     "Tell me about your shipment and I’ll list the forms you need.\n"
@@ -236,21 +292,21 @@ st.write(
     "Then I show the required forms and why each one is needed."
 )
 
-# ==== Natural-language input (plain English -> structured) ====
+# -------------------- Natural-language input --------------------
 with st.expander("🗣️ Describe your shipment in plain English", expanded=True):
     nl = st.text_area(
-        "Example: “We’re shipping **IP modems** from the **US** to **Germany**, $12,000, on pallets.”",
+        "Example: “We’re importing **fertilizer** from **Brazil** to the **United States**, no price yet.”",
         height=120
     )
     if st.button("Understand my description"):
         llm = parse_nl_llm(nl) or {}
         heur = parse_nl_heuristic(nl) or {}
         merged = {
-            "origin": llm.get("origin") or heur.get("origin"),
-            "destination": llm.get("destination") or heur.get("destination"),
+            "origin": _norm_country(llm.get("origin") or heur.get("origin")),
+            "destination": _norm_country(llm.get("destination") or heur.get("destination")),
             "hs_list": llm.get("hs_list") or heur.get("hs_list"),
             "hs_fallback_prefix": llm.get("hs_fallback_prefix") or heur.get("hs_fallback_prefix"),
-            "value": llm.get("value", None) if llm.get("value", None) is not None else heur.get("value"),
+            "value": llm.get("value") if llm.get("value") is not None else heur.get("value"),
             "quantity": llm.get("quantity") or heur.get("quantity"),
             "quantity_unit": llm.get("quantity_unit") or heur.get("quantity_unit"),
             "packaging": llm.get("packaging") or heur.get("packaging"),
@@ -265,136 +321,104 @@ with st.expander("🗣️ Describe your shipment in plain English", expanded=Tru
 
 nl_result = st.session_state.get("nl_result", {}) if "nl_result" in st.session_state else {}
 
-# ---- Input explanation (what each input means)
+# -------------------- Shipment details --------------------
 st.markdown("### Shipment details")
 st.info(
     "• **Origin**: where the goods leave from.\n"
     "• **Destination**: where the goods arrive.\n"
-    "• **HS Code**: the product classification. Chapter/heading (e.g., 85 or 8517.62) is okay.\n"
-    "• **Invoice Value (USD)**: the shipment price. Used for thresholds like EEI."
+    "• **HS Code**: 4-digit heading preferred (e.g., 8701). 2-digit chapter is okay (e.g., 31).\n"
+    "• **Invoice Value (USD)**: used for thresholds like EEI."
 )
 
-# Defaults from NL
-countries = ["US","DE","EU","IN","CN","GB","LK"]
-pref_origin      = nl_result.get("origin") or "US"
-pref_destination = nl_result.get("destination") or "DE"
-pref_hs = (nl_result.get("hs_list") or [None])[0] or nl_result.get("hs_fallback_prefix") or "8517.62"
-pref_value = nl_result.get("value") if nl_result.get("value") is not None else 12000.0
+# AI/heuristic-driven defaults (no hard electronics default)
+pref_origin      = nl_result.get("origin") or ""
+pref_destination = nl_result.get("destination") or ""
+# Choose explicit HS if provided, else fallback prefix from commodity
+pref_hs_raw = (nl_result.get("hs_list") or [None])[0] or nl_result.get("hs_fallback_prefix")
+pref_hs = normalize_hs(pref_hs_raw) if pref_hs_raw else ""
 
-# ——— Minimal input UI (packaging/flags now fixed and hidden)
+pref_value = nl_result.get("value") if nl_result.get("value") is not None else 0.0
+
 col1, col2, col3 = st.columns(3)
 with col1:
-    origin_input = st.text_input("Origin (country name or code)", nl_result.get("origin") or "US")
-    hs = st.text_input("HS Code or prefix", pref_hs)
-
+    origin_input = st.text_input("Origin (country name or code)", value=pref_origin)
+    hs_input = st.text_input("HS Code (4-digit heading or 2-digit chapter)", value=pref_hs)
 with col2:
-    destination_input = st.text_input("Destination (country name or code)", nl_result.get("destination") or "DE")
-    value = st.number_input("Invoice Value (USD)", min_value=0.0,
-                            value=float(nl_result.get("value")) if nl_result.get("value") is not None else 12000.0,
-                            step=100.0)
-
-# Normalize whatever the user typed to your ISO-like codes
-def _normalize_country_free(s: str):
-    if not s: return None
-    s = s.strip()
-    # try direct 2-letter code first
-    if len(s) in (2,3) and s.upper() in (_VALID_COUNTRIES + ["EU"]):
-        return s.upper()
-    # try alias map
-    c = _ALIAS_TO_ISO.get(s.lower())
-    if c: return c
-    # try the simple guesser
-    c = _guess_country(s)
-    return c
-
-origin = _normalize_country_free(origin_input) or "US"
-destination = _normalize_country_free(destination_input) or "DE"
-
-# Optional: warn if we had to fall back
-if not _normalize_country_free(origin_input):
-    st.warning("Could not recognize the origin you typed — defaulting to US.")
-if not _normalize_country_free(destination_input):
-    st.warning("Could not recognize the destination you typed — defaulting to DE.")
-
+    destination_input = st.text_input("Destination (country name or code)", value=pref_destination)
+    value = st.number_input("Invoice Value (USD)", min_value=0.0, value=float(pref_value), step=100.0)
 with col3:
-    st.write("")  # spacer
+    st.write("")
     st.write("")
 
-# Fixed (hidden) settings to keep UX simple
-packaging = nl_result.get("packaging") or "standard"
-flags = nl_result.get("flags") or []
+origin = _norm_country(origin_input)
+destination = _norm_country(destination_input)
+hs = normalize_hs(hs_input)
 
 st.caption("Please review these details before compiling.")
 
-# ---- Rule helpers
-def hs_prefixes(hs_code: str):
-    hs_code = (hs_code or "").replace(" ", "")
-    parts = re.split(r"[.\-]", hs_code)
-    out = []
-    if len(parts) >= 1 and parts[0]: out.append(parts[0])
-    if len(parts) >= 2:
-        out.append(parts[0] + parts[1])
-        out.append(parts[0] + "." + parts[1])
-    if len(parts) >= 3:
-        out.append(parts[0] + parts[1] + parts[2])
-        out.append(parts[0] + "." + parts[1] + "." + parts[2])
-        out.append(parts[0] + parts[1] + "." + parts[2])
-    seen, res = set(), []
-    for p in out:
-        if p not in seen: res.append(p); seen.add(p)
-    return res
+# If user skipped the “Understand” step, try to parse silently at compile time
+def _auto_fill_from_nl_if_needed(nl_text: str):
+    global origin, destination, hs
+    if origin and destination and hs:
+        return
+    if not nl_text:
+        return
+    llm = parse_nl_llm(nl_text) or {}
+    heur = parse_nl_heuristic(nl_text) or {}
+    origin  = origin  or _norm_country(llm.get("origin") or heur.get("origin"))
+    destination = destination or _norm_country(llm.get("destination") or heur.get("destination"))
+    if not hs:
+        picked = (llm.get("hs_list") or heur.get("hs_list") or [])
+        picked = picked[0] if picked else (llm.get("hs_fallback_prefix") or heur.get("hs_fallback_prefix"))
+        hs = normalize_hs(picked) if picked else hs
 
+# -------------------- Rule helpers --------------------
 def cond_true(cond: dict, payload: dict) -> bool:
-    # origin must match exactly
+    # origin exact
     if "origin" in cond and payload.get("origin") != cond["origin"]:
         return False
-
-    # destination must be one of the allowed values
+    # destination in list
     if "destination_in" in cond and payload.get("destination") not in cond["destination_in"]:
         return False
-
-    # HS prefix logic — true if ANY target matches ANY of the prefixes
+    # HS prefix match (chapter or heading)
     if "hs_prefix_in" in cond:
         prefs = payload.get("hs_prefixes", [])
         targets = cond["hs_prefix_in"]
         if not any(any(p.startswith(t) or p == t for p in prefs) for t in targets):
             return False
-
-    # value threshold (split into two lines to avoid the syntax error)
+    # value threshold
     if "value_gt" in cond:
         v = payload.get("value")
         if v is None or float(v) <= float(cond["value_gt"]):
             return False
-
-    # packaging equality (read from payload, not outer variable)
+    # packaging equality
     if "packaging_eq" in cond and payload.get("packaging") != cond["packaging_eq"]:
         return False
-
-    # flags containment (read from payload, not outer variable)
+    # flags containment
     if "flags_has" in cond and cond["flags_has"] not in payload.get("flags", []):
         return False
-
     return True
 
-
-# ---- Compile
+# -------------------- Compile --------------------
 if st.button("Compile requirements", type="primary"):
+    # auto-parse if needed (so fertilizer/brazil/us works without clicking Understand)
+    _auto_fill_from_nl_if_needed(nl)
+
     payload = {
         "origin": origin,
         "destination": destination,
         "hs": hs,
         "value": value,
-        "packaging": packaging,     # fixed behind the scenes
-        "flags": flags,             # fixed behind the scenes
+        "packaging": nl_result.get("packaging") or "standard",
+        "flags": nl_result.get("flags") or [],
         "hs_prefixes": hs_prefixes(hs),
     }
 
-    # Base set
+    # Base forms
     required = {"CI", "PL"}
-    # Track reasons per form (form -> [reasons])
     reasons_by_form = {"CI": ["Core document"], "PL": ["Core document"]}
 
-    # Apply rules
+    # Apply rules (ensure your electronics rule uses {"hs_prefix_in":["85"]})
     if not rules_df.empty:
         for _, r in rules_df.iterrows():
             try:
@@ -402,38 +426,33 @@ if st.button("Compile requirements", type="primary"):
                 if cond_true(cond, payload):
                     for f in adds:
                         required.add(f)
-                        reasons_by_form.setdefault(f, []).append(f'Rule: {r["name"]}')
+                        reasons_by_form.setdefault(f, []).append(f'Rule: {r.get("name","(unnamed)")}')
             except Exception:
                 st.warning(f"Skipped a bad rule row: {getattr(r,'name','(no name)')}")
     else:
         st.info("No active rules loaded — showing only core forms (CI, PL).")
 
-    # ---- Results: Required forms and their rationale
+    # Results
     st.subheader("✅ Required forms and their rationale")
     for i, f in enumerate(sorted(required), start=1):
         reason = "; ".join(reasons_by_form.get(f, ["Matched rule(s)"]))
         st.write(f"{i}. **{f}**: {reason}")
 
-    # (Removed “Fields to capture” per request)
-
-    # ---- Generate documents (CI / PL only)
+    # Generate documents (CI/PL only)
     if PDF_OK:
         st.subheader("📄 Generate documents")
-        # Minimal dummy CI line item
         items_ci = [{
-            "description": "IP Modem",
-            "hs_code": hs,
-            "qty": 1,
-            "unit": "pcs",
-            "unit_price": f"{value:,.2f}",
-            "amount": f"{value:,.2f}",
+            "description": "Line item",
+            "hs_code": hs or "",
+            "qty": 1, "unit": "pcs",
+            "unit_price": f"{value:,.2f}", "amount": f"{value:,.2f}",
         }]
         subtot = value; freight = 0.0; insurance = 0.0; total = subtot + freight + insurance
         base_data = {
             "exporter_name": "Exporter (enter on final form)",
             "consignee_name": "Consignee (enter on final form)",
-            "origin": origin,
-            "destination": destination,
+            "origin": origin or "",
+            "destination": destination or "",
             "incoterm": "DAP",
             "currency": "USD",
             "invoice_no": "INV-001",
@@ -447,20 +466,19 @@ if st.button("Compile requirements", type="primary"):
             "net_weight_kg": "",
             "shipment_ref": "INV-001",
         }
-
         if "CI" in required:
             ci_buf = make_ci_pdf(base_data, items_ci)
             st.download_button(
-                "⬇️ Download Commercial Invoice (Document)",
+                "⬇️ Download Commercial Invoice (PDF)",
                 data=ci_buf.getvalue(),
                 file_name=f"{base_data['invoice_no']}_Commercial_Invoice.pdf",
                 mime="application/pdf"
             )
         if "PL" in required:
-            pl_rows = [{"pkg_no": 1, "description": "IP Modem", "qty": 1, "unit": "pcs", "gross_wt": "", "net_wt": ""}]
+            pl_rows = [{"pkg_no": 1, "description": "Line item", "qty": 1, "unit": "pcs", "gross_wt": "", "net_wt": ""}]
             pl_buf = make_pl_pdf(base_data, pl_rows)
             st.download_button(
-                "⬇️ Download Packing List (Document)",
+                "⬇️ Download Packing List (PDF)",
                 data=pl_buf.getvalue(),
                 file_name=f"{base_data['invoice_no']}_Packing_List.pdf",
                 mime="application/pdf"
