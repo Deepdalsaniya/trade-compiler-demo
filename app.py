@@ -35,8 +35,13 @@ _COUNTRY_MAP = {
     "lanka":"LK","sri lanka":"LK","sl":"LK",
     "mexico":"MX","mx":"MX",
     "brazil":"BR","br":"BR"
-    "canada": "CA", "ca": "CA"
 }
+
+# --- Countries we were missing
+_COUNTRY_MAP.update({
+    "canada": "CA",
+    "ca": "CA"
+})
 
 # Chapter/heading hints by commodity keywords
 _HS_HINTS = {
@@ -63,6 +68,11 @@ _FLAG_WORDS = {
 
 _VALID_COUNTRIES = ["US","DE","EU","IN","CN","GB","LK","PK","BD","AE","SA","SG","MY","TH","VN","MX","BR"]
 _ALIAS_TO_ISO = {**{k:v for k,v in _COUNTRY_MAP.items()}}
+
+_ALIAS_TO_ISO.update({
+    "canada": "CA",
+    "ca": "CA"
+})
 
 _MONTHS = {"jan","feb","mar","apr","may","jun","jul","aug","sep","sept","oct","nov","dec",
            "january","february","march","april","june","july","august","september","october","november","december"}
