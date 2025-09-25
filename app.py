@@ -1,4 +1,4 @@
-# app.py — Compliance Compiler (AI-first, HS normalized, no irrelevant forms)
+# app.py — Compliance Compiler (AI-first, HS normalized, relevant rules only)
 
 import json, re
 import pandas as pd
@@ -34,14 +34,9 @@ _COUNTRY_MAP = {
     "united kingdom":"GB","uk":"GB","england":"GB",
     "lanka":"LK","sri lanka":"LK","sl":"LK",
     "mexico":"MX","mx":"MX",
-    "brazil":"BR","br":"BR"
+    "brazil":"BR","br":"BR",
+    "canada":"CA","ca":"CA",
 }
-
-# --- Countries we were missing
-_COUNTRY_MAP.update({
-    "canada": "CA",
-    "ca": "CA"
-})
 
 # Chapter/heading hints by commodity keywords
 _HS_HINTS = {
@@ -51,28 +46,19 @@ _HS_HINTS = {
     "apparel":"62","clothing":"62","garment":"62","shirt":"62","trousers":"62","jeans":"62","textile":"62","fabric":"62",
     # metals / food
     "brass":"74","honey":"0409",
-    # new: fertilizer, tractors
+    # fertilizer, tractors, eggs
     "fertilizer":"31","fertilisers":"31",
-    "tractor":"8701","tractors":"8701"
+    "tractor":"8701","tractors":"8701",
+    "egg":"0407","eggs":"0407",
 }
-
-_HS_HINTS.update({
-    "egg": "0407",
-    "eggs": "0407"
-})
 
 _FLAG_WORDS = {
     "controlled":"controlled","dual use":"controlled","dual-use":"controlled",
     "hazmat":"hazmat","dangerous goods":"hazmat","battery":"battery"
 }
 
-_VALID_COUNTRIES = ["US","DE","EU","IN","CN","GB","LK","PK","BD","AE","SA","SG","MY","TH","VN","MX","BR"]
+_VALID_COUNTRIES = ["US","DE","EU","IN","CN","GB","LK","PK","BD","AE","SA","SG","MY","TH","VN","MX","BR","CA"]
 _ALIAS_TO_ISO = {**{k:v for k,v in _COUNTRY_MAP.items()}}
-
-_ALIAS_TO_ISO.update({
-    "canada": "CA",
-    "ca": "CA"
-})
 
 _MONTHS = {"jan","feb","mar","apr","may","jun","jul","aug","sep","sept","oct","nov","dec",
            "january","february","march","april","june","july","august","september","october","november","december"}
@@ -126,7 +112,7 @@ def _extract_flags(text:str):
     return sorted(flags)
 
 def normalize_hs(hs_code: str) -> str:
-    """Return normalized HS: 4-digit heading when possible, else 2-digit chapter."""
+    """Return normalized HS: 4-digit heading when possible, else 2-digit chapter (keep leading zeros)."""
     if not hs_code: return ""
     clean = re.sub(r"[^\d]", "", hs_code)
     if not clean: return ""
@@ -314,17 +300,6 @@ with st.expander("🗣️ Describe your shipment in plain English", expanded=Tru
         "Example: “We’re importing **fertilizer** from **Brazil** to the **United States**, no price yet.”",
         height=120
     )
-    if (not origin or not destination or not hs):
-    if nl and nl.strip():
-        llm = parse_nl_llm(nl) or {}
-        heur = parse_nl_heuristic(nl) or {}
-        origin = origin or _norm_country(llm.get("origin") or heur.get("origin"))
-        destination = destination or _norm_country(llm.get("destination") or heur.get("destination"))
-        if not hs:
-            pick = (llm.get("hs_list") or heur.get("hs_list") or [])
-            pick = pick[0] if pick else (llm.get("hs_fallback_prefix") or heur.get("hs_fallback_prefix"))
-            hs = normalize_hs(pick) if pick else hs
-            
     if st.button("Understand my description"):
         llm = parse_nl_llm(nl) or {}
         heur = parse_nl_heuristic(nl) or {}
@@ -348,6 +323,7 @@ with st.expander("🗣️ Describe your shipment in plain English", expanded=Tru
 
 nl_result = st.session_state.get("nl_result", {}) if "nl_result" in st.session_state else {}
 
+# Preview chips (helps reviewers see what was understood)
 if nl_result:
     chips = []
     if nl_result.get("origin"): chips.append(f"Origin: {nl_result['origin']}")
@@ -369,10 +345,8 @@ st.info(
 # AI/heuristic-driven defaults (no hard electronics default)
 pref_origin      = nl_result.get("origin") or ""
 pref_destination = nl_result.get("destination") or ""
-# Choose explicit HS if provided, else fallback prefix from commodity
 pref_hs_raw = (nl_result.get("hs_list") or [None])[0] or nl_result.get("hs_fallback_prefix")
 pref_hs = normalize_hs(pref_hs_raw) if pref_hs_raw else ""
-
 pref_value = nl_result.get("value") if nl_result.get("value") is not None else 0.0
 
 col1, col2, col3 = st.columns(3)
@@ -392,21 +366,21 @@ hs = normalize_hs(hs_input)
 
 st.caption("Please review these details before compiling.")
 
-# If user skipped the “Understand” step, try to parse silently at compile time
-def _auto_fill_from_nl_if_needed(nl_text: str):
-    global origin, destination, hs
+def auto_fill_from_nl_if_needed(nl_text: str, origin, destination, hs):
+    """No globals. Returns (origin, destination, hs) after a quick NL parse if needed."""
     if origin and destination and hs:
-        return
-    if not nl_text:
-        return
+        return origin, destination, hs
+    if not (nl_text and nl_text.strip()):
+        return origin, destination, hs
     llm = parse_nl_llm(nl_text) or {}
     heur = parse_nl_heuristic(nl_text) or {}
-    origin  = origin  or _norm_country(llm.get("origin") or heur.get("origin"))
+    origin = origin or _norm_country(llm.get("origin") or heur.get("origin"))
     destination = destination or _norm_country(llm.get("destination") or heur.get("destination"))
     if not hs:
         picked = (llm.get("hs_list") or heur.get("hs_list") or [])
         picked = picked[0] if picked else (llm.get("hs_fallback_prefix") or heur.get("hs_fallback_prefix"))
         hs = normalize_hs(picked) if picked else hs
+    return origin, destination, hs
 
 # -------------------- Rule helpers --------------------
 def cond_true(cond: dict, payload: dict) -> bool:
@@ -437,8 +411,18 @@ def cond_true(cond: dict, payload: dict) -> bool:
 
 # -------------------- Compile --------------------
 if st.button("Compile requirements", type="primary"):
-    # auto-parse if needed (so fertilizer/brazil/us works without clicking Understand)
-    _auto_fill_from_nl_if_needed(nl)
+    # Auto-parse if needed (so "eggs from canada to usa" works even without clicking Understand)
+    origin, destination, hs = auto_fill_from_nl_if_needed(nl, origin, destination, hs)
+
+    # Hard stop if still missing essentials (prevents irrelevant outputs)
+    missing = []
+    if not origin: missing.append("origin")
+    if not destination: missing.append("destination")
+    if not hs: missing.append("HS code (chapter or 4-digit heading)")
+    if missing:
+        st.error("I couldn’t extract: " + ", ".join(missing) + ". "
+                 "Please click **Understand my description** or fill the fields manually.")
+        st.stop()
 
     payload = {
         "origin": origin,
@@ -454,7 +438,7 @@ if st.button("Compile requirements", type="primary"):
     required = {"CI", "PL"}
     reasons_by_form = {"CI": ["Core document"], "PL": ["Core document"]}
 
-    # Apply rules (ensure your electronics rule uses {"hs_prefix_in":["85"]})
+    # Apply rules (make sure electronics rule uses {"hs_prefix_in":["85"]})
     if not rules_df.empty:
         for _, r in rules_df.iterrows():
             try:
@@ -465,18 +449,6 @@ if st.button("Compile requirements", type="primary"):
                         reasons_by_form.setdefault(f, []).append(f'Rule: {r.get("name","(unnamed)")}')
             except Exception:
                 st.warning(f"Skipped a bad rule row: {getattr(r,'name','(no name)')}")
-    
-    # Hard stop if still missing essentials (prevents irrelevant outputs)
-    missing = []
-    if not origin: missing.append("origin")
-    if not destination: missing.append("destination")
-    if not hs: missing.append("HS code (chapter or 4-digit heading)")
-    
-    if missing:
-        st.error("I couldn’t extract: " + ", ".join(missing) + ". "
-                 "Please click **Understand my description** or fill the fields manually.")
-        st.stop()
-
     else:
         st.info("No active rules loaded — showing only core forms (CI, PL).")
 
